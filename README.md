@@ -886,3 +886,76 @@ Citations:
 [25] How to Use SignalR for Real-Time Data Updates in .NET Apps https://blog.pixelfreestudio.com/how-to-use-signalr-for-real-time-data-updates-in-net-apps/
 [26] How to build chat Server and Client with SignalR and ASP.NET Web ... https://dotjord.wordpress.com/2018/05/20/how-to-build-chat-server-and-client-with-signalr-and-asp-net-web-api-part-2/
 [27] How to Implement Real-Time Web Applications with SignalR in ASP ... https://www.avidclan.com/blog/how-to-implement-real-time-web-applications-with-signalr-in-asp-net-core-a-step-by-step-guide/
+
+
+
+
+
+public class WSChatController : ApiController
+{
+    // Store all connected clients
+    private static readonly HashSet<WebSocket> Clients = new HashSet<WebSocket>();
+    private static readonly object ClientsLock = new object();
+
+    public HttpResponseMessage Get()
+    {
+        if (HttpContext.Current.IsWebSocketRequest)
+        {
+            HttpContext.Current.AcceptWebSocketRequest(ProcessWSChat);
+        }
+        return new HttpResponseMessage(HttpStatusCode.SwitchingProtocols);
+    }
+
+    private async Task ProcessWSChat(AspNetWebSocketContext context)
+    {
+        var socket = context.WebSocket;
+        lock (ClientsLock)
+        {
+            Clients.Add(socket);
+        }
+
+        try
+        {
+            while (socket.State == WebSocketState.Open)
+            {
+                var buffer = new ArraySegment<byte>(new byte[1024]);
+                var result = await socket.ReceiveAsync(buffer, CancellationToken.None);
+
+                if (result.MessageType == WebSocketMessageType.Text)
+                {
+                    string userMessage = Encoding.UTF8.GetString(buffer.Array, 0, result.Count);
+                    var responseBytes = Encoding.UTF8.GetBytes(userMessage);
+
+                    lock (ClientsLock)
+                    {
+                        foreach (var client in Clients)
+                        {
+                            if (client.State == WebSocketState.Open)
+                            {
+                                await client.SendAsync(
+                                    new ArraySegment<byte>(responseBytes),
+                                    WebSocketMessageType.Text, true, CancellationToken.None
+                                );
+                            }
+                        }
+                    }
+                }
+                else if (result.MessageType == WebSocketMessageType.Close)
+                {
+                    break;
+                }
+            }
+        }
+        finally
+        {
+            lock (ClientsLock)
+            {
+                Clients.Remove(socket);
+            }
+            if (socket.State == WebSocketState.Open || socket.State == WebSocketState.CloseReceived)
+            {
+                await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closing", CancellationToken.None);
+            }
+        }
+    }
+}
