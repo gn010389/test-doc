@@ -959,3 +959,152 @@ public class WSChatController : ApiController
         }
     }
 }
+
+
+
+
+
+
+
+
+
+
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Web;
+using System.Web.Http;
+using System.Net.WebSockets;
+
+public class WSChatController : ApiController
+{
+    // Store all connected clients
+    private static readonly HashSet<WebSocket> Clients = new HashSet<WebSocket>();
+    private static readonly object ClientsLock = new object();
+
+    // Document editing state tracking
+    private static readonly object EditStateLock = new object();
+    private static string CurrentEditor = null; // currently editing user ID
+
+    public static int ConnectedUserCount
+    {
+        get
+        {
+            lock (ClientsLock)
+            {
+                return Clients.Count(client => client.State == WebSocketState.Open);
+            }
+        }
+    }
+
+    public HttpResponseMessage Get()
+    {
+        if (HttpContext.Current.IsWebSocketRequest)
+        {
+            HttpContext.Current.AcceptWebSocketRequest(ProcessWSChat);
+        }
+        return new HttpResponseMessage(HttpStatusCode.SwitchingProtocols);
+    }
+
+    private async Task ProcessWSChat(AspNetWebSocketContext context)
+    {
+        var socket = context.WebSocket;
+
+        // Add client
+        lock (ClientsLock)
+        {
+            Clients.Add(socket);
+        }
+
+        // Identify client user (replace with real auth if available)
+        string userId = context.User?.Identity?.Name ?? socket.GetHashCode().ToString();
+
+        // Notify clients about new connection
+        await BroadcastMessageAsync($"User {userId} connected. Users online: {ConnectedUserCount}");
+
+        try
+        {
+            while (socket.State == WebSocketState.Open)
+            {
+                var buffer = new ArraySegment<byte>(new byte[1024]);
+                var result = await socket.ReceiveAsync(buffer, CancellationToken.None);
+
+                if (result.MessageType == WebSocketMessageType.Text)
+                {
+                    string message = Encoding.UTF8.GetString(buffer.Array, 0, result.Count);
+
+                    if (message.StartsWith("edit:start"))
+                    {
+                        lock (EditStateLock)
+                        {
+                            CurrentEditor = userId;
+                        }
+                        await BroadcastMessageAsync($"User {userId} started editing the document.");
+                    }
+                    else if (message.StartsWith("edit:stop"))
+                    {
+                        lock (EditStateLock)
+                        {
+                            if (CurrentEditor == userId)
+                                CurrentEditor = null;
+                        }
+                        await BroadcastMessageAsync($"User {userId} stopped editing the document.");
+                    }
+                    else
+                    {
+                        // Broadcast normal message
+                        await BroadcastMessageAsync($"User {userId}: {message}");
+                    }
+                }
+                else if (result.MessageType == WebSocketMessageType.Close)
+                {
+                    break;
+                }
+            }
+        }
+        finally
+        {
+            // Remove client
+            lock (ClientsLock)
+            {
+                Clients.Remove(socket);
+            }
+
+            // Clear editing state if this client was editing
+            lock (EditStateLock)
+            {
+                if (CurrentEditor == userId)
+                    CurrentEditor = null;
+            }
+
+            // Notify about disconnection
+            await BroadcastMessageAsync($"User {userId} disconnected. Users online: {ConnectedUserCount}");
+
+            if (socket.State == WebSocketState.Open || socket.State == WebSocketState.CloseReceived)
+            {
+                await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closing", CancellationToken.None);
+            }
+        }
+    }
+
+    private async Task BroadcastMessageAsync(string message)
+    {
+        List<WebSocket> clientsSnapshot;
+        byte[] responseBytes = Encoding.UTF8.GetBytes(message);
+
+        lock (ClientsLock)
+        {
+            clientsSnapshot = Clients.Where(c => c.State == WebSocketState.Open).ToList();
+        }
+
+        foreach (var client in clientsSnapshot)
+        {
+            await client.SendAsync(new ArraySegment<byte>(responseBytes), WebSocketMessageType.Text, true, CancellationToken.None);
+        }
+    }
+}
+
